@@ -411,63 +411,211 @@ class MainWindow(QtWidgets.QMainWindow):
         self.perform_save(out_path)
 
     def perform_save(self, out_path):
-        def get_font(size):
-            try: return ImageFont.truetype("arial.ttf", size)
-            except: return ImageFont.load_default()
-
-        marker_size_px = self.spin_size.value()
-
+        """
+        Saves the file. 
+        - If PDF: Draws vector shapes (resolution independent).
+        - If Image: Draws high-res raster shapes scaled to image size.
+        """
         if self.source_type == 'pdf':
-            scale = 2.0
-            page = self.source_doc.load_page(0)
-            pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale))
-            base_img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-            draw = ImageDraw.Draw(base_img)
-            for rx, ry, num, ang in self.markers:
-                r = int(marker_size_px * scale)
-                font = get_font(int(r * 0.9))
-                self._pil_draw_balloon(draw, rx, ry, num, ang, base_img.width, base_img.height, r, font)
-            
-            with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tf:
-                base_img.save(tf.name, quality=95)
-                new_doc = fitz.open()
-                new_page = new_doc.new_page(width=page.rect.width, height=page.rect.height)
-                new_page.insert_image(page.rect, filename=tf.name)
-                new_doc.save(out_path)
-                new_doc.close()
-            os.remove(tf.name)
+            self._save_pdf_vector(out_path)
         else:
-            base_img = Image.open(self.source_path).convert("RGB")
-            draw = ImageDraw.Draw(base_img)
-            for rx, ry, num, ang in self.markers:
-                r = marker_size_px
-                font = get_font(int(r * 0.9))
-                self._pil_draw_balloon(draw, rx, ry, num, ang, base_img.width, base_img.height, r, font)
-            base_img.save(out_path)
-        
+            self._save_image_raster(out_path)
+
         self.status_label.setText(f"Saved to {out_path}")
         QtWidgets.QMessageBox.information(self, "Saved", "File saved successfully.")
 
-    def _pil_draw_balloon(self, draw, rx, ry, num, angle, w, h, r, font):
+    def _save_pdf_vector(self, out_path):
+        """
+        Draws markers directly onto the PDF page using PyMuPDF (fitz) vector methods.
+        This ensures 100% crisp quality at any zoom level.
+        """
+        # Create a new handle for the doc to avoid interfering with the open view
+        # or just use the existing self.source_doc but save to a new path
+        doc = fitz.open(self.source_path)
+        page = doc[0]  # Assuming single page for now, or match logic
+        
+        page_w = page.rect.width
+        page_h = page.rect.height
+
+        # Base size from slider
+        base_size = self.spin_size.value()
+        
+        # Define color (PyMuPDF uses 0.0-1.0 float tuples for colors)
+        red = (1, 0, 0)
+        white = (1, 1, 1)
+        black = (0, 0, 0)
+
+        for rx, ry, num, ang in self.markers:
+            # Calculate positions
+            tip_x = rx * page_w
+            tip_y = ry * page_h
+            r = base_size # In PDF points, roughly equal to screen pixels
+            
+            # --- Draw Pointer (Triangle) ---
+            tail_len = r * 1.2
+            theta = math.radians(ang)
+            dx = math.cos(theta)
+            dy = math.sin(theta)
+
+            cx = tip_x - dx * (tail_len + r)
+            cy = tip_y - dy * (tail_len + r)
+            
+            # Perpendicular vector for tail width
+            pdx, pdy = -dy, dx
+            tail_w = r * 0.5
+            
+            # Triangle points
+            p_tip = fitz.Point(tip_x, tip_y)
+            p_base1 = fitz.Point(cx + pdx * tail_w, cy + pdy * tail_w)
+            p_base2 = fitz.Point(cx - pdx * tail_w, cy - pdy * tail_w)
+            
+            # Draw filled red triangle (no border needed if filled)
+            shape = page.new_shape()
+            shape.draw_poly([p_tip, p_base1, p_base2])
+            shape.finish(color=red, fill=red, width=0)
+            shape.commit()
+
+            # --- Draw Circle ---
+            # Draw filled white circle with red border
+            shape = page.new_shape()
+            shape.draw_circle(fitz.Point(cx, cy), r)
+            shape.finish(color=red, fill=white, width=max(1, r/7))
+            shape.commit()
+
+            # --- Draw Text ---
+            # Insert text centered at (cx, cy)
+            # PyMuPDF insert_text anchor is bottom-left usually, or we use text_writer
+            font_size = int(r * 0.9) # Slightly larger for PDF clarity
+            
+            # Text alignment logic
+            text_val = str(num)
+            
+            # We use a TextWriter to center alignment easily
+            tw = fitz.TextWriter(page.rect)
+            font = fitz.Font("helv") # Standard Helvetica
+            
+            # Measure text to center it
+            text_len = font.text_length(text_val, fontsize=font_size)
+            text_x = cx - (text_len / 2)
+            text_y = cy + (font_size * 0.35) # Approximate vertical centering
+            
+            page.insert_text((text_x, text_y), text_val, fontsize=font_size, fontname="helv", color=black)
+
+        doc.save(out_path)
+        doc.close()
+
+    def _save_image_raster(self, out_path):
+        """
+        Saves as PNG/JPG using 4x Super-Sampling with corrected text size.
+        """
+        print(f"--- SAVING IMAGE TO: {out_path} ---")
+
+        # 1. Load the base image
+        base_img = Image.open(self.source_path).convert("RGBA")
+        orig_w, orig_h = base_img.size
+        
+        # 2. Setup Super-Sampling (4x resolution)
+        SUPERSAMPLE = 4
+        super_w = orig_w * SUPERSAMPLE
+        super_h = orig_h * SUPERSAMPLE
+        
+        # Create a transparent overlay for high-quality drawing
+        overlay = Image.new("RGBA", (super_w, super_h), (255, 255, 255, 0))
+        draw = ImageDraw.Draw(overlay)
+        
+        # 3. Calculate Sizes
+        scale_factor = max(1.0, orig_w / 1000.0)
+        user_r = self.spin_size.value()
+        final_r = int(user_r * scale_factor * SUPERSAMPLE)
+
+        # --- SIZE FIX IS HERE ---
+        # WAS: int(final_r * 1.3)  <-- This was too big
+        # NOW: int(final_r * 0.75) <-- This fits perfectly inside the circle
+        font_size = int(final_r * 0.9)
+        
+        print(f"DEBUG: Radius={final_r}, Font Size={font_size}")
+
+        # 4. Load High-Res Font
+        font = None
+        font_candidates = [
+            "arial.ttf", "Arial.ttf", 
+            "/Library/Fonts/Arial.ttf", 
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 
+            "C:\\Windows\\Fonts\\arial.ttf"
+        ]
+        
+        for f_path in font_candidates:
+            try:
+                font = ImageFont.truetype(f_path, font_size)
+                break
+            except OSError:
+                continue
+                
+        if font is None:
+            print("WARNING: Default font used (Size might look wrong)")
+            font = ImageFont.load_default()
+
+        # 5. Draw on the Giant Overlay
+        for rx, ry, num, ang in self.markers:
+            self._pil_draw_balloon(draw, rx, ry, num, ang, super_w, super_h, final_r, font, 1.0)
+
+        # 6. Shrink Overlay back to Original Size
+        overlay_smooth = overlay.resize((orig_w, orig_h), resample=Image.Resampling.LANCZOS)
+        
+        # 7. Composite and Save
+        final_img = Image.alpha_composite(base_img, overlay_smooth)
+        final_img.convert("RGB").save(out_path, quality=95)
+        print("--- SAVE COMPLETE ---")
+
+    def _pil_draw_balloon(self, draw, rx, ry, num, angle, w, h, r, font, scale):
+        """
+        Draws the balloon with thin edges but THICK numbers.
+        """
         tip_x, tip_y = rx * w, ry * h
         tail_len = int(r * 1.2)
         theta = math.radians(angle)
         dx, dy = math.cos(theta), math.sin(theta)
+        
         cx = tip_x - dx * (tail_len + r)
         cy = tip_y - dy * (tail_len + r)
+        
         pdx, pdy = -dy, dx
         tail_w = r * 0.5
+        
+        # 1. CIRCLE THICKNESS (Thinner)
+        # Higher number = Thinner line (e.g. 10.0 or 12.0)
+        circle_thickness = max(2, int(r / 8.0))
+        
+        # 2. NUMBER THICKNESS (Thicker)
+        # We simulate BOLD by adding a stroke width.
+        # Lower number = Thicker text (e.g. r / 20.0 is very bold, r / 40.0 is medium)
+        text_stroke = max(1, int(r / 30.0))
+
+        # Draw Tail (Triangle)
         p1 = (tip_x, tip_y)
         p2 = (cx + pdx * tail_w, cy + pdy * tail_w)
         p3 = (cx - pdx * tail_w, cy - pdy * tail_w)
         draw.polygon([p1, p2, p3], fill=(255, 0, 0))
-        bbox = [cx-r, cy-r, cx+r, cy+r]
-        draw.ellipse(bbox, fill=(255, 255, 255), outline=(255,0,0), width=max(1, int(r/7)))
+        
+        # Draw Circle
+        bbox = [cx - r, cy - r, cx + r, cy + r]
+        draw.ellipse(bbox, fill=(255, 255, 255), outline=(255, 0, 0), width=circle_thickness)
+        
+        # Draw Text
+        text_str = str(num)
         try:
-            draw.text((cx, cy), str(num), font=font, fill=(0,0,0), anchor="mm")
-        except:
-            tw, th = draw.textsize(str(num), font=font)
-            draw.text((cx-tw/2, cy-th/2), str(num), font=font, fill=(0,0,0))
+            left, top, right, bottom = draw.textbbox((0, 0), text_str, font=font, stroke_width=text_stroke)
+            tw = right - left
+            th = bottom - top
+            # Adjust Y slightly because stroke makes text taller
+            text_pos = (cx - tw / 2, cy - th / 2 - (th * 0.1)) 
+        except AttributeError:
+            tw, th = draw.textsize(text_str, font=font, stroke_width=text_stroke)
+            text_pos = (cx - tw / 2, cy - th / 2)
+
+        # Draw text with stroke_width to make it BOLD
+        draw.text(text_pos, text_str, font=font, fill=(0, 0, 0), stroke_width=text_stroke, stroke_fill=(0, 0, 0))
+
 
 if __name__ == "__main__":
     app = QtWidgets.QApplication(sys.argv)
